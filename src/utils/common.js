@@ -285,6 +285,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     const currentRetry = retryContext?.currentRetry ?? 0;
     const CONFIG = retryContext?.CONFIG;
     const isRetry = currentRetry > 0;
+    // Pin model for the full retry chain to avoid cross-request/model contamination.
+    const pinnedModel = retryContext?.pinnedModel || model;
     
     // 使用共享的 clientDisconnected 状态（如果是重试，继承上层的状态）
     let clientDisconnected = retryContext?.clientDisconnected || { value: false };
@@ -317,8 +319,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
     // The service returns a stream in its native format (toProvider).
     const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
-    requestBody.model = model;
-    const nativeStream = await service.generateContentStream(model, requestBody);
+    const requestPayload = { ...requestBody, model: pinnedModel };
+    const nativeStream = await service.generateContentStream(pinnedModel, requestPayload);
     const addEvent = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE || getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
 
     let hasToolCall = false;
@@ -340,7 +342,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
             // Convert the complete chunk object to the client's format (fromProvider), if necessary.
             const chunkToSend = needsConversion
-                ? convertData(nativeChunk, 'streamChunk', toProvider, fromProvider, model)
+                ? convertData(nativeChunk, 'streamChunk', toProvider, fromProvider, pinnedModel)
                 : nativeChunk;
 
             // 监控钩子：流式响应分块
@@ -352,7 +354,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         chunkToSend,
                         fromProvider,
                         toProvider,
-                        model,
+                        model: pinnedModel,
                         requestId: CONFIG._monitorRequestId
                     });
                 } catch (e) {}
@@ -526,7 +528,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             try {
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-                const result = await getApiServiceWithFallback(CONFIG, model);
+                const result = await getApiServiceWithFallback(CONFIG, pinnedModel);
                 
                 if (result && result.service) {
                     logger.info(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -537,6 +539,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         CONFIG,
                         currentRetry: currentRetry + 1,
                         maxRetries,
+                        pinnedModel,
                         clientDisconnected  // 传递断开状态
                     };
                     
@@ -544,7 +547,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     return await handleStreamRequest(
                         res,
                         result.service,
-                        result.actualModel || model,
+                        pinnedModel,
                         requestBody,
                         fromProvider,
                         result.actualProviderType || toProvider,
@@ -631,20 +634,22 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
     const maxRetries = retryContext?.maxRetries ?? 5;
     const currentRetry = retryContext?.currentRetry ?? 0;
     const CONFIG = retryContext?.CONFIG;
+    // Pin model for the full retry chain to avoid cross-request/model contamination.
+    const pinnedModel = retryContext?.pinnedModel || model;
     
     try{
         // The service returns the response in its native format (toProvider).
         const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
-        requestBody.model = model;
+        const requestPayload = { ...requestBody, model: pinnedModel };
         // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
-        const nativeResponse = await service.generateContent(model, requestBody);
+        const nativeResponse = await service.generateContent(pinnedModel, requestPayload);
         const responseText = extractResponseText(nativeResponse, toProvider);
 
         // Convert the response back to the client's format (fromProvider), if necessary.
         let clientResponse = nativeResponse;
         if (needsConversion) {
             logger.info(`[Response Convert] Converting response from ${toProvider} to ${fromProvider}`);
-            clientResponse = convertData(nativeResponse, 'response', toProvider, fromProvider, model);
+            clientResponse = convertData(nativeResponse, 'response', toProvider, fromProvider, pinnedModel);
         }
 
         // 监控钩子：非流式响应
@@ -656,7 +661,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                     clientResponse,
                     fromProvider,
                     toProvider,
-                    model,
+                    model: pinnedModel,
                     requestId: CONFIG._monitorRequestId
                 });
             } catch (e) {}
@@ -724,7 +729,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
             try {
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-                const result = await getApiServiceWithFallback(CONFIG, model);
+                const result = await getApiServiceWithFallback(CONFIG, pinnedModel);
                 
                 if (result && result.service) {
                     logger.info(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -734,14 +739,15 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                         ...retryContext,
                         CONFIG,
                         currentRetry: currentRetry + 1,
-                        maxRetries
+                        maxRetries,
+                        pinnedModel
                     };
                     
                     // 递归调用，使用新的服务
                     return await handleUnaryRequest(
                         res,
                         result.service,
-                        result.actualModel || model,
+                        pinnedModel,
                         requestBody,
                         fromProvider,
                         result.actualProviderType || toProvider,
@@ -920,7 +926,7 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     // - 凭证切换重试：凭证被标记不健康后切换到其他凭证
     // 当没有不同的健康凭证可用时，重试会自动停止
     const credentialSwitchMaxRetries = CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
-    const retryContext = providerPoolManager ? { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries } : null;
+    const retryContext = providerPoolManager ? { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, pinnedModel: model } : null;
     
     if (isStream) {
         await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);

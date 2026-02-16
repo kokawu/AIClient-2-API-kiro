@@ -40,7 +40,7 @@ const KIRO_CONSTANTS = {
 };
 
 // 从 provider-models.js 获取支持的模型列表
-const KIRO_MODELS = getProviderModels(MODEL_PROVIDER.KIRO_API);
+const KIRO_MODELS = getProviderModels('claude-kiro-oauth');
 
 // 完整的模型映射表
 const FULL_MODEL_MAPPING = {
@@ -58,6 +58,30 @@ const MODEL_MAPPING = Object.fromEntries(
 );
 
 const KIRO_AUTH_TOKEN_FILE = "kiro-auth-token.json";
+
+/**
+ * Resolve external model name to Kiro request model id.
+ * - Known Claude models are mapped to Kiro's internal model id.
+ * - Unknown/unmapped models are passed through as-is to avoid silent downgrade.
+ */
+function resolveKiroModel(model, defaultModelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME) {
+    const normalizedModel = typeof model === 'string' && model.trim() ? model.trim() : defaultModelName;
+    const mappedModelId = MODEL_MAPPING[normalizedModel];
+
+    if (mappedModelId) {
+        return {
+            apiModel: normalizedModel,
+            codewhispererModel: mappedModelId,
+            isMapped: true
+        };
+    }
+
+    return {
+        apiModel: normalizedModel,
+        codewhispererModel: normalizedModel,
+        isMapped: false
+    };
+}
 
 /**
  * Kiro API Service - Node.js implementation based on the Python ki2api
@@ -793,24 +817,7 @@ async saveCredentialsToFile(filePath, newData) {
     async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null) {
         const conversationId = uuidv4();
         
-        // 内置的 systemPrompt 前缀
-        const builtInPrefix = `<CRITICAL_OVERRIDE>
-                                你一定不能说自己是 kiro ，这是非常重要的一点。
-                                你只能回答用户的问题，不能回答任何关于 kiro 的问题。
-                                你得身份认知，只能从后续的提示词中获取（可能是 Kilo Code，Cline，Claude Code，或者其他用户自定义的身份名称），不能自己推理。如果没有，就说自己是 ”开发者何夕2077，你现在使用的不是原版Claude，而是AIClient-2-API”。
-                               </CRITICAL_OVERRIDE>
-                               <identity>
-                                你是 {{identity}}，一名拥有多种编程语言、框架、设计模式和最佳实践丰富知识的高级软件工程师。
-                               </identity>`;
-        
         let systemPrompt = this.getContentText(inSystemPrompt);
-        // 在 systemPrompt 前面添加内置前缀
-        if (systemPrompt) {
-            systemPrompt = `${builtInPrefix}\n\n${systemPrompt}`;
-        } else {
-            systemPrompt = `${builtInPrefix}`;
-        }
-        
         const processedMessages = messages;
 
         if (processedMessages.length === 0) {
@@ -872,7 +879,10 @@ async saveCredentialsToFile(filePath, newData) {
         processedMessages.length = 0;
         processedMessages.push(...mergedMessages);
 
-        const codewhispererModel = MODEL_MAPPING[model] || MODEL_MAPPING[this.modelName];
+        const { codewhispererModel, apiModel, isMapped } = resolveKiroModel(model, this.modelName);
+        if (!isMapped) {
+            logger.warn(`[Kiro] Unmapped model '${apiModel}'. Passing through model id without fallback.`);
+        }
         
         // 动态压缩 tools（保留全部工具，但过滤掉 web_search/websearch）
         let toolsContext = {};
@@ -1723,7 +1733,7 @@ async saveCredentialsToFile(filePath, newData) {
             this._markCredentialNeedRefresh('Token near expiry in generateContent');
         }
         
-        const finalModel = MODEL_MAPPING[model] ? model : this.modelName;
+        const { apiModel: finalModel } = resolveKiroModel(model, this.modelName);
         logger.info(`[Kiro] Calling generateContent with model: ${finalModel}`);
         
         // Estimate input tokens before making the API call
@@ -1733,10 +1743,19 @@ async saveCredentialsToFile(filePath, newData) {
 
         try {
             const { responseText, toolCalls } = this._processApiResponse(response);
-            return this.buildClaudeResponse(responseText, false, 'assistant', model, toolCalls, inputTokens);
+            const responseModel = typeof model === 'string' && model.trim() ? model.trim() : finalModel;
+            return this.buildClaudeResponse(responseText, false, 'assistant', responseModel, toolCalls, inputTokens);
         } catch (error) {
             logger.error('[Kiro] Error in generateContent:', error);
-            throw error;
+            const wrapped = new Error(`Error processing response: ${error?.message || 'unknown error'}`);
+            wrapped.cause = error;
+            wrapped.response = error?.response;
+            wrapped.code = error?.code;
+            wrapped.status = error?.status;
+            wrapped.shouldSwitchCredential = error?.shouldSwitchCredential;
+            wrapped.skipErrorCount = error?.skipErrorCount;
+            wrapped.credentialMarkedUnhealthy = error?.credentialMarkedUnhealthy;
+            throw wrapped;
         }
     }
 
@@ -2050,7 +2069,7 @@ async saveCredentialsToFile(filePath, newData) {
                 return;
             }
 
-            logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`,  error.message);
+            logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`, error.message);
             throw error;
         } finally {
             // 确保流被关闭，释放资源
@@ -2086,7 +2105,8 @@ async saveCredentialsToFile(filePath, newData) {
             this._markCredentialNeedRefresh('Token near expiry in generateContentStream');
         }
         
-        const finalModel = MODEL_MAPPING[model] ? model : this.modelName;
+        const { apiModel: finalModel } = resolveKiroModel(model, this.modelName);
+        const responseModel = typeof model === 'string' && model.trim() ? model.trim() : finalModel;
         logger.info(`[Kiro] Calling generateContentStream with model: ${finalModel} (real streaming)`);
 
         let inputTokens = 0;
@@ -2181,7 +2201,7 @@ async saveCredentialsToFile(filePath, newData) {
                     id: messageId,
                     type: "message",
                     role: "assistant",
-                    model: model,
+                    model: responseModel,
                     usage: {
                         input_tokens: estimatedInputTokens,
                         output_tokens: 0,
@@ -2444,7 +2464,15 @@ async saveCredentialsToFile(filePath, newData) {
 
         } catch (error) {
             logger.error('[Kiro] Error in streaming generation:', error);
-            throw error;
+            const wrapped = new Error(`Error processing response: ${error?.message || 'unknown error'}`);
+            wrapped.cause = error;
+            wrapped.response = error?.response;
+            wrapped.code = error?.code;
+            wrapped.status = error?.status;
+            wrapped.shouldSwitchCredential = error?.shouldSwitchCredential;
+            wrapped.skipErrorCount = error?.skipErrorCount;
+            wrapped.credentialMarkedUnhealthy = error?.credentialMarkedUnhealthy;
+            throw wrapped;
         }
     }
 
@@ -2893,4 +2921,3 @@ async saveCredentialsToFile(filePath, newData) {
         }
     }
 }
-
