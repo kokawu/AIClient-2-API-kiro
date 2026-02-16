@@ -191,7 +191,6 @@ export class OpenAIApiService {
     async generateContent(model, requestBody) {
         // 临时存储 monitorRequestId
         if (requestBody._monitorRequestId) {
-            this.config._monitorRequestId = requestBody._monitorRequestId;
             delete requestBody._monitorRequestId;
         }
 
@@ -201,7 +200,6 @@ export class OpenAIApiService {
     async *generateContentStream(model, requestBody) {
         // 临时存储 monitorRequestId
         if (requestBody._monitorRequestId) {
-            this.config._monitorRequestId = requestBody._monitorRequestId;
             delete requestBody._monitorRequestId;
         }
 

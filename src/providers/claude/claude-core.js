@@ -228,7 +228,6 @@ export class ClaudeApiService {
     async generateContent(model, requestBody) {
         // 临时存储 monitorRequestId
         if (requestBody._monitorRequestId) {
-            this.config._monitorRequestId = requestBody._monitorRequestId;
             delete requestBody._monitorRequestId;
         }
         

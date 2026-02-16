@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
+import { AsyncLocalStorage } from 'async_hooks';
 
 /**
  * 统一日志工具类
@@ -22,6 +23,7 @@ class Logger {
         this.logStream = null;
         this.currentRequestId = null; // 当前请求ID
         this.requestContext = new Map(); // 存储请求上下文
+        this.asyncLocalStorage = new AsyncLocalStorage();
         this.levels = {
             debug: 0,
             info: 1,
@@ -88,6 +90,7 @@ class Logger {
         }
         this.currentRequestId = requestId;
         this.requestContext.set(requestId, context);
+        this.asyncLocalStorage.enterWith({ requestId });
         return requestId;
     }
 
@@ -96,8 +99,8 @@ class Logger {
      * @returns {string} 请求ID
      */
     getCurrentRequestId() {
-        // 从上下文中获取当前请求ID
-        return this.currentRequestId;
+        const store = this.asyncLocalStorage.getStore();
+        return store?.requestId || this.currentRequestId;
     }
 
     /**
@@ -117,7 +120,9 @@ class Logger {
         if (requestId) {
             this.requestContext.delete(requestId);
         }
-        this.currentRequestId = null;
+        if (!requestId || this.currentRequestId === requestId) {
+            this.currentRequestId = null;
+        }
     }
 
     /**

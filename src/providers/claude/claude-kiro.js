@@ -814,7 +814,7 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * Build CodeWhisperer request from OpenAI messages
      */
-    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null) {
+    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, monitorRequestId = null) {
         const conversationId = uuidv4();
         
         let systemPrompt = this.getContentText(inSystemPrompt);
@@ -1290,13 +1290,13 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         // 监控钩子：内部请求转换
-        if (this.config?._monitorRequestId) {
+        if (monitorRequestId) {
             try {
                 const { getPluginManager } = await import('../../core/plugin-manager.js');
                 const pluginManager = getPluginManager();
                 if (pluginManager) {
                     await pluginManager.executeHook('onInternalRequestConverted', {
-                        requestId: this.config._monitorRequestId,
+                        requestId: monitorRequestId,
                         internalRequest: request,
                         converterName: 'buildCodewhispererRequest'
                     });
@@ -1413,7 +1413,7 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * 调用 API 并处理错误重试
      */
-    async callApi(method, model, body, isRetry = false, retryCount = 0) {
+    async callApi(method, model, body, isRetry = false, retryCount = 0, monitorRequestId = null) {
         if (!this.isInitialized) await this.initialize();
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
@@ -1432,7 +1432,7 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, monitorRequestId);
 
         try {
             const token = this.accessToken; // Use the already initialized token
@@ -1530,7 +1530,7 @@ async saveCredentialsToFile(filePath, newData) {
                 const errorIdentifier = errorCode || errorMessage.substring(0, 50);
                 logger.info(`[Kiro] Network error (${errorIdentifier}). Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
                 await new Promise(resolve => setTimeout(resolve, delay));
-                return this.callApi(method, model, body, isRetry, retryCount + 1);
+                return this.callApi(method, model, body, isRetry, retryCount + 1, monitorRequestId);
             }
 
             logger.error(`[Kiro] API call failed (Status: ${status}, Code: ${errorCode}):`, error.message);
@@ -1721,9 +1721,8 @@ async saveCredentialsToFile(filePath, newData) {
     async generateContent(model, requestBody) {
         if (!this.isInitialized) await this.initialize();
 
-        // 临时存储 monitorRequestId
+        const monitorRequestId = requestBody._monitorRequestId || null;
         if (requestBody._monitorRequestId) {
-            this.config._monitorRequestId = requestBody._monitorRequestId;
             delete requestBody._monitorRequestId;
         }
         
@@ -1739,7 +1738,7 @@ async saveCredentialsToFile(filePath, newData) {
         // Estimate input tokens before making the API call
         const inputTokens = this.estimateInputTokens(requestBody);
         
-        const response = await this.callApi('', finalModel, requestBody);
+        const response = await this.callApi('', finalModel, requestBody, false, 0, monitorRequestId);
 
         try {
             const { responseText, toolCalls } = this._processApiResponse(response);
@@ -1908,7 +1907,7 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * 真正的流式 API 调用 - 使用 responseType: 'stream'
      */
-    async * streamApiReal(method, model, body, isRetry = false, retryCount = 0) {
+    async * streamApiReal(method, model, body, isRetry = false, retryCount = 0, monitorRequestId = null) {
         if (!this.isInitialized) await this.initialize();
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
@@ -1927,7 +1926,7 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, monitorRequestId);
 
         const token = this.accessToken;
         const headers = {
@@ -2065,7 +2064,7 @@ async saveCredentialsToFile(filePath, newData) {
                 const errorIdentifier = errorCode || errorMessage.substring(0, 50);
                 logger.info(`[Kiro] Network error (${errorIdentifier}) in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
                 await new Promise(resolve => setTimeout(resolve, delay));
-                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
+                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1, monitorRequestId);
                 return;
             }
 
@@ -2080,9 +2079,9 @@ async saveCredentialsToFile(filePath, newData) {
     }
 
     // 保留旧的非流式方法用于 generateContent
-    async streamApi(method, model, body, isRetry = false, retryCount = 0) {
+    async streamApi(method, model, body, isRetry = false, retryCount = 0, monitorRequestId = null) {
         try {
-            return await this.callApi(method, model, body, isRetry, retryCount);
+            return await this.callApi(method, model, body, isRetry, retryCount, monitorRequestId);
         } catch (error) {
             logger.error('[Kiro] Error calling API:', error);
             throw error;
@@ -2093,9 +2092,8 @@ async saveCredentialsToFile(filePath, newData) {
     async * generateContentStream(model, requestBody) {
         if (!this.isInitialized) await this.initialize();
 
-        // 临时存储 monitorRequestId
+        const monitorRequestId = requestBody._monitorRequestId || null;
         if (requestBody._monitorRequestId) {
-            this.config._monitorRequestId = requestBody._monitorRequestId;
             delete requestBody._monitorRequestId;
         }
         
@@ -2213,7 +2211,7 @@ async saveCredentialsToFile(filePath, newData) {
             };
 
             // 2. 流式接收并发送每个 content_block_delta
-            for await (const event of this.streamApiReal('', finalModel, requestBody)) {
+            for await (const event of this.streamApiReal('', finalModel, requestBody, false, 0, monitorRequestId)) {
                 if (event.type === 'contextUsage' && event.contextUsagePercentage) {
                     // 捕获上下文使用百分比（包含输入和输出的总使用量）
                     contextUsagePercentage = event.contextUsagePercentage;

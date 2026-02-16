@@ -653,7 +653,6 @@ export class QwenApiService {
     async generateContent(model, requestBody) {
         // 临时存储 monitorRequestId
         if (requestBody._monitorRequestId) {
-            this.config._monitorRequestId = requestBody._monitorRequestId;
             delete requestBody._monitorRequestId;
         }
 
@@ -674,7 +673,6 @@ export class QwenApiService {
     async *generateContentStream(model, requestBody) {
         // 临时存储 monitorRequestId
         if (requestBody._monitorRequestId) {
-            this.config._monitorRequestId = requestBody._monitorRequestId;
             delete requestBody._monitorRequestId;
         }
 
