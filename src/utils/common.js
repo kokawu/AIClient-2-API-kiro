@@ -861,7 +861,6 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     if (!model) {
         throw new Error("Could not determine the model from the request.");
     }
-    model = _applyRequestedModelPolicy(CONFIG, model);
     logger.info(`[Content Generation] Model: ${model}, Stream: ${isStream}`);
 
     let actualCustomName = CONFIG.customName;
@@ -950,36 +949,6 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
             });
         } catch (e) { /* 静默失败，不影响主流程 */ }
     }
-}
-
-/**
- * Apply optional model lock policy.
- * If LOCKED_MODEL is configured:
- * - LOCKED_MODEL_MODE=force: silently rewrites incoming model to locked model
- * - default/reject: rejects non-locked model requests with 400
- */
-function _applyRequestedModelPolicy(config, model) {
-    const lockedModel = typeof config?.LOCKED_MODEL === 'string' ? config.LOCKED_MODEL.trim() : '';
-    if (!lockedModel) {
-        return model;
-    }
-
-    if (model === lockedModel) {
-        return model;
-    }
-
-    const lockMode = typeof config?.LOCKED_MODEL_MODE === 'string'
-        ? config.LOCKED_MODEL_MODE.trim().toLowerCase()
-        : 'reject';
-
-    if (lockMode === 'force') {
-        logger.warn(`[Model Lock] Rewriting requested model '${model}' to locked model '${lockedModel}'.`);
-        return lockedModel;
-    }
-
-    const error = new Error(`Model '${model}' is blocked by LOCKED_MODEL policy. Allowed model: '${lockedModel}'.`);
-    error.statusCode = 400;
-    throw error;
 }
 
 /**
