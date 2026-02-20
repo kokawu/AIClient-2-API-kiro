@@ -14,21 +14,26 @@ import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog } from '../../
 import { getProviderPoolManager } from '../../services/service-manager.js';
 
 const KIRO_THINKING = {
+    MIN_BUDGET_TOKENS: 1024,
     MAX_BUDGET_TOKENS: 24576,
     DEFAULT_BUDGET_TOKENS: 20000,
     START_TAG: '<thinking>',
     END_TAG: '</thinking>',
     MODE_TAG: '<thinking_mode>',
     MAX_LEN_TAG: '<max_thinking_length>',
+    EFFORT_TAG: '<thinking_effort>',
 };
 
 const KIRO_CONSTANTS = {
     REFRESH_URL: 'https://prod.{{region}}.auth.desktop.kiro.dev/refreshToken',
     REFRESH_IDC_URL: 'https://oidc.{{region}}.amazonaws.com/token',
     BASE_URL: 'https://q.{{region}}.amazonaws.com/generateAssistantResponse',
+    LIST_MODELS_PATH: 'ListAvailableModels',
     DEFAULT_MODEL_NAME: 'claude-sonnet-4-5',
     AXIOS_TIMEOUT: 120000, // 2 minutes timeout for normal requests
     TOKEN_REFRESH_TIMEOUT: 15000, // 15 seconds timeout for token refresh (shorter to avoid blocking)
+    MODEL_LIST_CACHE_TTL_MS: 24 * 60 * 60 * 1000, // 24 hours
+    MODEL_LIST_FETCH_TIMEOUT_MS: 10000, // 10 seconds
     USER_AGENT: 'KiroIDE',
     KIRO_VERSION: '0.8.140',
     CONTENT_TYPE_JSON: 'application/json',
@@ -45,11 +50,18 @@ const KIRO_MODELS = getProviderModels('claude-kiro-oauth');
 // 完整的模型映射表
 const FULL_MODEL_MAPPING = {
     "claude-haiku-4-5":"claude-haiku-4.5",
+    "claude-haiku-4.5":"claude-haiku-4.5",
     "claude-opus-4-6":"claude-opus-4.6",
+    "claude-opus-4.6":"claude-opus-4.6",
+    "claude-sonnet-4-6":"claude-sonnet-4.6",
     "claude-opus-4-5":"claude-opus-4.5",
+    "claude-opus-4.5":"claude-opus-4.5",
     "claude-opus-4-5-20251101":"claude-opus-4.5",
+    "claude-opus-4.5-20251101":"claude-opus-4.5",
     "claude-sonnet-4-5": "CLAUDE_SONNET_4_5_20250929_V1_0",
-    "claude-sonnet-4-5-20250929": "CLAUDE_SONNET_4_5_20250929_V1_0"
+    "claude-sonnet-4.5": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "claude-sonnet-4-5-20250929": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "claude-sonnet-4.5-20250929": "CLAUDE_SONNET_4_5_20250929_V1_0"
 };
 
 // 只保留 KIRO_MODELS 中存在的模型映射
@@ -64,23 +76,97 @@ const KIRO_AUTH_TOKEN_FILE = "kiro-auth-token.json";
  * - Known Claude models are mapped to Kiro's internal model id.
  * - Unknown/unmapped models are passed through as-is to avoid silent downgrade.
  */
+function normalizeDashVersionModel(modelName) {
+    if (typeof modelName !== 'string' || !modelName.trim()) {
+        return modelName;
+    }
+    return modelName.trim().replace(/-(\d+)-(\d+)(?=(?:-|$))/g, '-$1.$2');
+}
+
+const KIRO_MODEL_ALIASES = {
+    'minimax-m2-1': 'minimax-m2.1',
+    'minimax-m2_1': 'minimax-m2.1',
+    'minimax-m2-5': 'minimax-m2.5',
+    'minimax-m2_5': 'minimax-m2.5',
+};
+
+function normalizeExternalModelAlias(modelName) {
+    if (typeof modelName !== 'string' || !modelName.trim()) {
+        return modelName;
+    }
+    const trimmed = modelName.trim();
+    return KIRO_MODEL_ALIASES[trimmed] || normalizeDashVersionModel(trimmed);
+}
+
 function resolveKiroModel(model, defaultModelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME) {
     const normalizedModel = typeof model === 'string' && model.trim() ? model.trim() : defaultModelName;
-    const mappedModelId = MODEL_MAPPING[normalizedModel];
+    const aliasedModel = normalizeExternalModelAlias(normalizedModel);
+    const mappedModelId = MODEL_MAPPING[normalizedModel] || MODEL_MAPPING[aliasedModel];
+    const apiModel = MODEL_MAPPING[normalizedModel] ? normalizedModel : aliasedModel;
 
     if (mappedModelId) {
         return {
-            apiModel: normalizedModel,
+            apiModel,
             codewhispererModel: mappedModelId,
             isMapped: true
         };
     }
 
     return {
-        apiModel: normalizedModel,
-        codewhispererModel: normalizedModel,
+        apiModel,
+        codewhispererModel: apiModel,
         isMapped: false
     };
+}
+
+function normalizeModelName(model, fallback = KIRO_CONSTANTS.DEFAULT_MODEL_NAME) {
+    if (typeof model === 'string' && model.trim()) {
+        return model.trim();
+    }
+    return fallback;
+}
+
+function parsePositiveInteger(value, fallbackValue) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return fallbackValue;
+    }
+    return Math.floor(parsed);
+}
+
+function parseBoolean(value, fallbackValue = true) {
+    if (value === undefined || value === null) {
+        return fallbackValue;
+    }
+    if (typeof value === 'boolean') {
+        return value;
+    }
+    if (typeof value === 'string') {
+        return !['false', '0', 'off', 'no'].includes(value.trim().toLowerCase());
+    }
+    return Boolean(value);
+}
+
+function buildUnsupportedModelError(model, supportedModels, source) {
+    const preview = supportedModels.slice(0, 20).join(', ');
+    const suffix = supportedModels.length > 20 ? ', ...' : '';
+    const error = new Error(
+        `[Kiro] Unsupported model '${model}'. Cache source: ${source}. Supported models: ${preview}${suffix}`
+    );
+    error.status = 400;
+    error.code = 400;
+    error.statusCode = 400;
+    error.skipErrorCount = true;
+    error.response = {
+        status: 400,
+        data: {
+            error: 'unsupported_model',
+            model,
+            cacheSource: source,
+            supportedModels
+        }
+    };
+    return error;
 }
 
 /**
@@ -140,6 +226,42 @@ function findRealTag(text, tag, startIndex = 0) {
             return pos;
         }
         
+        searchStart = pos + 1;
+    }
+}
+
+function isWhitespaceOnly(text) {
+    if (text === null || text === undefined) return true;
+    return String(text).trim().length === 0;
+}
+
+/**
+ * Find a "real" thinking end tag that is not quoted/backticked and is followed by '\n\n'.
+ * This avoids prematurely closing a thinking block when the model mentions `</thinking>`
+ * inside the thinking content.
+ */
+function findRealThinkingEndTag(buffer, startIndex = 0) {
+    let searchStart = Math.max(0, startIndex);
+    while (true) {
+        const pos = findRealTag(buffer, KIRO_THINKING.END_TAG, searchStart);
+        if (pos === -1) return -1;
+        const after = buffer.slice(pos + KIRO_THINKING.END_TAG.length);
+        if (after.startsWith('\n\n')) return pos;
+        searchStart = pos + 1;
+    }
+}
+
+/**
+ * Find a "real" thinking end tag only when it is at the buffer end (after it is whitespace only).
+ * This is used for boundary-event scenarios (tool_use starts immediately after thinking, or stream end).
+ */
+function findRealThinkingEndTagAtBufferEnd(buffer, startIndex = 0) {
+    let searchStart = Math.max(0, startIndex);
+    while (true) {
+        const pos = findRealTag(buffer, KIRO_THINKING.END_TAG, searchStart);
+        if (pos === -1) return -1;
+        const after = buffer.slice(pos + KIRO_THINKING.END_TAG.length);
+        if (isWhitespaceOnly(after)) return pos;
         searchStart = pos + 1;
     }
 }
@@ -403,6 +525,22 @@ export class KiroApiService {
         this.modelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME;
         this.axiosInstance = null; // Initialize later in async method
         this.axiosSocialRefreshInstance = null;
+        this.modelListCacheTtlMs = parsePositiveInteger(
+            config.KIRO_MODEL_LIST_CACHE_TTL_MS,
+            KIRO_CONSTANTS.MODEL_LIST_CACHE_TTL_MS
+        );
+        this.modelListFetchTimeoutMs = parsePositiveInteger(
+            config.KIRO_MODEL_LIST_FETCH_TIMEOUT_MS,
+            KIRO_CONSTANTS.MODEL_LIST_FETCH_TIMEOUT_MS
+        );
+        this.strictModelValidation = parseBoolean(config.KIRO_STRICT_MODEL_VALIDATION, true);
+        this.allowUnlistedModelPassthrough = parseBoolean(config.KIRO_ALLOW_UNLISTED_MODEL_PASSTHROUGH, true);
+        this.modelListCache = {
+            models: [...new Set(KIRO_MODELS.map(name => normalizeModelName(name)).filter(Boolean))],
+            updatedAt: 0,
+            source: 'static-default',
+            stale: true,
+        };
     }
  
     async initialize() {
@@ -576,6 +714,143 @@ async loadCredentials() {
         logger.warn(`[Kiro Auth] Error during credential loading: ${error.message}`);
     }
 }
+
+    _isModelListCacheFresh() {
+        if (!this.modelListCache?.updatedAt) {
+            return false;
+        }
+        return Date.now() - this.modelListCache.updatedAt < this.modelListCacheTtlMs;
+    }
+
+    _replaceModelListCache(models, source, stale = false) {
+        const normalized = [...new Set((models || []).map(name => normalizeModelName(name)).filter(Boolean))];
+        this.modelListCache = {
+            models: normalized,
+            updatedAt: Date.now(),
+            source,
+            stale,
+        };
+        return this.modelListCache.models;
+    }
+
+    _extractModelNamesFromResponse(payload) {
+        const sourceModels = Array.isArray(payload?.models) ? payload.models : [];
+        const extracted = [];
+        for (const item of sourceModels) {
+            if (typeof item === 'string') {
+                extracted.push(normalizeModelName(item));
+                continue;
+            }
+            if (!item || typeof item !== 'object') {
+                continue;
+            }
+            const candidate =
+                item.name ??
+                item.model ??
+                item.modelId ??
+                item.modelName ??
+                item.id ??
+                item.value;
+            if (typeof candidate === 'string' && candidate.trim()) {
+                extracted.push(candidate.trim());
+            }
+        }
+        return [...new Set(extracted.filter(Boolean))];
+    }
+
+    _buildListModelsUrl() {
+        const configuredUrl = this.config.KIRO_LIST_MODELS_URL;
+        const region = this.region || 'us-east-1';
+        const baseUrl = configuredUrl
+            ? configuredUrl.replace('{{region}}', region)
+            : this.baseUrl.replace('generateAssistantResponse', KIRO_CONSTANTS.LIST_MODELS_PATH);
+
+        const url = new URL(baseUrl);
+        if (!url.searchParams.has('origin')) {
+            url.searchParams.set('origin', KIRO_CONSTANTS.ORIGIN_AI_EDITOR);
+        }
+        if (this.authMethod === KIRO_CONSTANTS.AUTH_METHOD_SOCIAL && this.profileArn && !url.searchParams.has('profileArn')) {
+            url.searchParams.set('profileArn', this.profileArn);
+        }
+        return url.toString();
+    }
+
+    async _fetchModelNamesFromUpstream() {
+        if (!this.accessToken) {
+            throw new Error('No access token available for ListAvailableModels');
+        }
+        const headers = {
+            'Authorization': `Bearer ${this.accessToken}`,
+            'amz-sdk-invocation-id': `${uuidv4()}`,
+        };
+        const listModelsUrl = this._buildListModelsUrl();
+        const response = await this.axiosInstance.get(listModelsUrl, {
+            headers,
+            timeout: this.modelListFetchTimeoutMs,
+        });
+        const modelNames = this._extractModelNamesFromResponse(response?.data);
+        if (modelNames.length === 0) {
+            throw new Error('ListAvailableModels returned empty model list');
+        }
+        this._replaceModelListCache(modelNames, 'upstream', false);
+        logger.info(`[Kiro] Model list refreshed from upstream: ${modelNames.length} models`);
+        return this.modelListCache.models;
+    }
+
+    async _getModelNames({ forceRefresh = false } = {}) {
+        if (!this.isInitialized) {
+            await this.initialize();
+        }
+
+        if (!forceRefresh && this._isModelListCacheFresh()) {
+            return this.modelListCache.models;
+        }
+
+        try {
+            return await this._fetchModelNamesFromUpstream();
+        } catch (error) {
+            const fallbackModels =
+                this.modelListCache?.models?.length > 0
+                    ? this.modelListCache.models
+                    : [...new Set(KIRO_MODELS.map(name => normalizeModelName(name)).filter(Boolean))];
+            const fallbackSource = this.modelListCache?.models?.length > 0 ? `${this.modelListCache.source}-stale` : 'static-default';
+            this._replaceModelListCache(fallbackModels, fallbackSource, true);
+            logger.warn(
+                `[Kiro] Failed to refresh model list from upstream, fallback to ${fallbackSource} (${fallbackModels.length} models): ${error.message}`
+            );
+            return this.modelListCache.models;
+        }
+    }
+
+    async _ensureSupportedModelOrThrow(model) {
+        const requestedModel = normalizeExternalModelAlias(normalizeModelName(model, this.modelName));
+
+        if (!this.strictModelValidation) {
+            return requestedModel;
+        }
+
+        let allowedModels = await this._getModelNames();
+        if (allowedModels.includes(requestedModel)) {
+            return requestedModel;
+        }
+
+        // If current cache is stale (or not from upstream), force refresh once before rejecting.
+        if (this.modelListCache?.stale || this.modelListCache?.source !== 'upstream') {
+            allowedModels = await this._getModelNames({ forceRefresh: true });
+            if (allowedModels.includes(requestedModel)) {
+                return requestedModel;
+            }
+        }
+
+        if (this.allowUnlistedModelPassthrough) {
+            logger.warn(
+                `[Kiro] Model '${requestedModel}' not found in refreshed list; allowing passthrough. Cache source: ${this.modelListCache?.source || 'unknown'}`
+            );
+            return requestedModel;
+        }
+
+        throw buildUnsupportedModelError(requestedModel, allowedModels, this.modelListCache?.source || 'unknown');
+    }
 
 async initializeAuth(forceRefresh = false) {
     if (this.accessToken && !forceRefresh) {
@@ -766,18 +1041,32 @@ async saveCredentialsToFile(filePath, newData) {
             value = KIRO_THINKING.DEFAULT_BUDGET_TOKENS;
         }
         value = Math.floor(value);
+        if (value < KIRO_THINKING.MIN_BUDGET_TOKENS) value = KIRO_THINKING.MIN_BUDGET_TOKENS;
         return Math.min(value, KIRO_THINKING.MAX_BUDGET_TOKENS);
     }
 
     _generateThinkingPrefix(thinking) {
-        if (!thinking || thinking.type !== 'enabled') return null;
-        const budget = this._normalizeThinkingBudgetTokens(thinking.budget_tokens);
-        return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
+        if (!thinking || typeof thinking !== 'object') return null;
+        const type = String(thinking.type || '').toLowerCase().trim();
+
+        if (type === 'enabled') {
+            const budget = this._normalizeThinkingBudgetTokens(thinking.budget_tokens);
+            return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
+        }
+
+        if (type === 'adaptive') {
+            const effortRaw = typeof thinking.effort === 'string' ? thinking.effort : '';
+            const effort = effortRaw.toLowerCase().trim();
+            const normalizedEffort = (effort === 'low' || effort === 'medium' || effort === 'high') ? effort : 'high';
+            return `<thinking_mode>adaptive</thinking_mode><thinking_effort>${normalizedEffort}</thinking_effort>`;
+        }
+
+        return null;
     }
 
     _hasThinkingPrefix(text) {
         if (!text) return false;
-        return text.includes(KIRO_THINKING.MODE_TAG) || text.includes(KIRO_THINKING.MAX_LEN_TAG);
+        return text.includes(KIRO_THINKING.MODE_TAG) || text.includes(KIRO_THINKING.MAX_LEN_TAG) || text.includes(KIRO_THINKING.EFFORT_TAG);
     }
 
     _toClaudeContentBlocksFromKiroText(content) {
@@ -792,7 +1081,12 @@ async saveCredentialsToFile(filePath, newData) {
         const before = raw.slice(0, startPos);
         let rest = raw.slice(startPos + KIRO_THINKING.START_TAG.length);
         
-        const endPosInRest = findRealTag(rest, KIRO_THINKING.END_TAG);
+        // Strip a single leading newline after `<thinking>` for cleaner blocks.
+        if (rest.startsWith('\r\n')) rest = rest.slice(2);
+        else if (rest.startsWith('\n')) rest = rest.slice(1);
+
+        let endPosInRest = findRealThinkingEndTag(rest);
+        if (endPosInRest === -1) endPosInRest = findRealThinkingEndTagAtBufferEnd(rest);
         let thinking = '';
         let after = '';
         if (endPosInRest === -1) {
@@ -803,11 +1097,12 @@ async saveCredentialsToFile(filePath, newData) {
         }
         
         if (after.startsWith('\n\n')) after = after.slice(2);
+        if (isWhitespaceOnly(after)) after = '';
         
         const blocks = [];
-        if (before) blocks.push({ type: "text", text: before });
+        if (before && !isWhitespaceOnly(before)) blocks.push({ type: "text", text: before });
         blocks.push({ type: "thinking", thinking });
-        if (after) blocks.push({ type: "text", text: after });
+        if (after && !isWhitespaceOnly(after)) blocks.push({ type: "text", text: after });
         return blocks;
     }
 
@@ -1732,7 +2027,8 @@ async saveCredentialsToFile(filePath, newData) {
             this._markCredentialNeedRefresh('Token near expiry in generateContent');
         }
         
-        const { apiModel: finalModel } = resolveKiroModel(model, this.modelName);
+        const allowedModel = await this._ensureSupportedModelOrThrow(model);
+        const { apiModel: finalModel } = resolveKiroModel(allowedModel, this.modelName);
         logger.info(`[Kiro] Calling generateContent with model: ${finalModel}`);
         
         // Estimate input tokens before making the API call
@@ -1742,10 +2038,22 @@ async saveCredentialsToFile(filePath, newData) {
 
         try {
             const { responseText, toolCalls } = this._processApiResponse(response);
-            const responseModel = typeof model === 'string' && model.trim() ? model.trim() : finalModel;
-            return this.buildClaudeResponse(responseText, false, 'assistant', responseModel, toolCalls, inputTokens);
+            const thinkingType = requestBody?.thinking?.type;
+            const thinkingRequested = typeof thinkingType === 'string' &&
+                (thinkingType.toLowerCase() === 'enabled' || thinkingType.toLowerCase() === 'adaptive');
+            const contentForClaude = thinkingRequested
+                ? this._toClaudeContentBlocksFromKiroText(responseText)
+                : responseText;
+            const responseModel = allowedModel || finalModel;
+            return this.buildClaudeResponse(contentForClaude, false, 'assistant', responseModel, toolCalls, inputTokens);
         } catch (error) {
-            logger.error('[Kiro] Error in generateContent:', error);
+            logger.error('[Kiro] Error in generateContent:', {
+                message: error?.message || 'unknown error',
+                code: error?.code,
+                status: error?.response?.status ?? error?.status,
+                shouldSwitchCredential: Boolean(error?.shouldSwitchCredential),
+                retryableNetworkError: isRetryableNetworkError(error)
+            });
             const wrapped = new Error(`Error processing response: ${error?.message || 'unknown error'}`);
             wrapped.cause = error;
             wrapped.response = error?.response;
@@ -2103,25 +2411,31 @@ async saveCredentialsToFile(filePath, newData) {
             this._markCredentialNeedRefresh('Token near expiry in generateContentStream');
         }
         
-        const { apiModel: finalModel } = resolveKiroModel(model, this.modelName);
-        const responseModel = typeof model === 'string' && model.trim() ? model.trim() : finalModel;
+        const allowedModel = await this._ensureSupportedModelOrThrow(model);
+        const { apiModel: finalModel } = resolveKiroModel(allowedModel, this.modelName);
+        const responseModel = allowedModel || finalModel;
         logger.info(`[Kiro] Calling generateContentStream with model: ${finalModel} (real streaming)`);
 
         let inputTokens = 0;
         let contextUsagePercentage = null;
         const messageId = `${uuidv4()}`;
 
-        const thinkingRequested = requestBody?.thinking?.type === 'enabled';
+        const thinkingType = requestBody?.thinking?.type;
+        const thinkingRequested = typeof thinkingType === 'string' &&
+            (thinkingType.toLowerCase() === 'enabled' || thinkingType.toLowerCase() === 'adaptive');
 
         const streamState = {
             thinkingRequested,
             buffer: '',
+            pendingTextBeforeThinking: '',
             inThinking: false,
             thinkingExtracted: false,
             thinkingBlockIndex: null,
             textBlockIndex: null,
             nextBlockIndex: 0,
             stoppedBlocks: new Set(),
+            stripThinkingLeadingNewline: false,
+            stripTextLeadingNewlinesAfterThinking: false,
         };
 
         const ensureBlockStart = (blockType) => {
@@ -2231,24 +2545,58 @@ async saveCredentialsToFile(filePath, newData) {
                             const startPos = findRealTag(streamState.buffer, KIRO_THINKING.START_TAG);
                             if (startPos !== -1) {
                                 const before = streamState.buffer.slice(0, startPos);
-                                if (before) events.push(...createTextDeltaEvents(before));
+                                const beforeCombined = `${streamState.pendingTextBeforeThinking}${before}`;
+                                // Avoid creating meaningless text blocks before thinking.
+                                if (beforeCombined && !isWhitespaceOnly(beforeCombined)) {
+                                    events.push(...createTextDeltaEvents(beforeCombined));
+                                }
+                                streamState.pendingTextBeforeThinking = '';
 
                                 streamState.buffer = streamState.buffer.slice(startPos + KIRO_THINKING.START_TAG.length);
                                 streamState.inThinking = true;
+                                streamState.stripThinkingLeadingNewline = true;
                                 continue;
                             }
 
                             const safeLen = Math.max(0, streamState.buffer.length - KIRO_THINKING.START_TAG.length);
                             if (safeLen > 0) {
                                 const safeText = streamState.buffer.slice(0, safeLen);
-                                if (safeText) events.push(...createTextDeltaEvents(safeText));
+                                if (safeText) {
+                                    if (isWhitespaceOnly(safeText)) {
+                                        // Buffer whitespace until we know whether a thinking block appears.
+                                        // This prevents a leading text block from being created before thinking.
+                                        const maxKeep = 1024;
+                                        const remaining = maxKeep - streamState.pendingTextBeforeThinking.length;
+                                        if (remaining > 0) {
+                                            streamState.pendingTextBeforeThinking += safeText.slice(0, remaining);
+                                        }
+                                    } else {
+                                        const combined = `${streamState.pendingTextBeforeThinking}${safeText}`;
+                                        streamState.pendingTextBeforeThinking = '';
+                                        events.push(...createTextDeltaEvents(combined));
+                                    }
+                                }
                                 streamState.buffer = streamState.buffer.slice(safeLen);
                             }
                             break;
                         }
 
                         if (streamState.inThinking) {
-                            const endPos = findRealTag(streamState.buffer, KIRO_THINKING.END_TAG);
+                            // Strip a single leading newline after `<thinking>` (may be split across chunks).
+                            if (streamState.stripThinkingLeadingNewline) {
+                                if (streamState.buffer.startsWith('\r\n')) {
+                                    streamState.buffer = streamState.buffer.slice(2);
+                                    streamState.stripThinkingLeadingNewline = false;
+                                } else if (streamState.buffer.startsWith('\n')) {
+                                    streamState.buffer = streamState.buffer.slice(1);
+                                    streamState.stripThinkingLeadingNewline = false;
+                                } else if (streamState.buffer.length > 0) {
+                                    streamState.stripThinkingLeadingNewline = false;
+                                }
+                            }
+
+                            let endPos = findRealThinkingEndTag(streamState.buffer);
+                            if (endPos === -1) endPos = findRealThinkingEndTagAtBufferEnd(streamState.buffer);
                             if (endPos !== -1) {
                                 const thinkingPart = streamState.buffer.slice(0, endPos);
                                 if (thinkingPart) events.push(...createThinkingDeltaEvents(thinkingPart));
@@ -2256,13 +2604,13 @@ async saveCredentialsToFile(filePath, newData) {
                                 streamState.buffer = streamState.buffer.slice(endPos + KIRO_THINKING.END_TAG.length);
                                 streamState.inThinking = false;
                                 streamState.thinkingExtracted = true;
+                                streamState.stripThinkingLeadingNewline = false;
 
                                 events.push(...createThinkingDeltaEvents(""));
                                 events.push(...stopBlock(streamState.thinkingBlockIndex));
 
-                                if (streamState.buffer.startsWith('\n\n')) {
-                                    streamState.buffer = streamState.buffer.slice(2);
-                                }
+                                // Strip '\n\n' after the end tag once we switch back to text (may arrive in next chunk).
+                                streamState.stripTextLeadingNewlinesAfterThinking = true;
                                 continue;
                             }
 
@@ -2276,8 +2624,13 @@ async saveCredentialsToFile(filePath, newData) {
                         }
 
                         if (streamState.thinkingExtracted) {
-                            const rest = streamState.buffer;
+                            let rest = streamState.buffer;
                             streamState.buffer = '';
+                            if (streamState.stripTextLeadingNewlinesAfterThinking) {
+                                if (rest.startsWith('\r\n\r\n')) rest = rest.slice(4);
+                                else if (rest.startsWith('\n\n')) rest = rest.slice(2);
+                                streamState.stripTextLeadingNewlinesAfterThinking = false;
+                            }
                             if (rest) events.push(...createTextDeltaEvents(rest));
                             break;
                         }
@@ -2358,18 +2711,33 @@ async saveCredentialsToFile(filePath, newData) {
                 currentToolCall = null;
             }
 
-            if (thinkingRequested && streamState.buffer) {
+            if (thinkingRequested && (streamState.inThinking || streamState.buffer || streamState.pendingTextBeforeThinking)) {
                 if (streamState.inThinking) {
                     logger.warn('[Kiro] Incomplete thinking tag at stream end');
+                    // Strip a single leading newline after `<thinking>` if we haven't yet.
+                    if (streamState.stripThinkingLeadingNewline) {
+                        if (streamState.buffer.startsWith('\r\n')) streamState.buffer = streamState.buffer.slice(2);
+                        else if (streamState.buffer.startsWith('\n')) streamState.buffer = streamState.buffer.slice(1);
+                        streamState.stripThinkingLeadingNewline = false;
+                    }
                     yield* pushEvents(createThinkingDeltaEvents(streamState.buffer));
                     streamState.buffer = '';
                     yield* pushEvents(createThinkingDeltaEvents(""));
                     yield* pushEvents(stopBlock(streamState.thinkingBlockIndex));
                 } else if (!streamState.thinkingExtracted) {
-                    yield* pushEvents(createTextDeltaEvents(streamState.buffer));
+                    const remaining = `${streamState.pendingTextBeforeThinking}${streamState.buffer}`;
+                    streamState.pendingTextBeforeThinking = '';
+                    if (remaining) yield* pushEvents(createTextDeltaEvents(remaining));
                     streamState.buffer = '';
                 } else {
-                    yield* pushEvents(createTextDeltaEvents(streamState.buffer));
+                    let remaining = streamState.buffer;
+                    streamState.buffer = '';
+                    if (streamState.stripTextLeadingNewlinesAfterThinking) {
+                        if (remaining.startsWith('\r\n\r\n')) remaining = remaining.slice(4);
+                        else if (remaining.startsWith('\n\n')) remaining = remaining.slice(2);
+                        streamState.stripTextLeadingNewlinesAfterThinking = false;
+                    }
+                    if (remaining) yield* pushEvents(createTextDeltaEvents(remaining));
                     streamState.buffer = '';
                 }
             }
@@ -2461,7 +2829,13 @@ async saveCredentialsToFile(filePath, newData) {
             yield { type: "message_stop" };
 
         } catch (error) {
-            logger.error('[Kiro] Error in streaming generation:', error);
+            logger.error('[Kiro] Error in streaming generation:', {
+                message: error?.message || 'unknown error',
+                code: error?.code,
+                status: error?.response?.status ?? error?.status,
+                shouldSwitchCredential: Boolean(error?.shouldSwitchCredential),
+                retryableNetworkError: isRetryableNetworkError(error)
+            });
             const wrapped = new Error(`Error processing response: ${error?.message || 'unknown error'}`);
             wrapped.cause = error;
             wrapped.response = error?.response;
@@ -2500,9 +2874,17 @@ async saveCredentialsToFile(filePath, newData) {
         }
         
         // Count thinking prefix tokens if thinking is enabled
-        if (requestBody.thinking?.type === 'enabled') {
-            const budget = this._normalizeThinkingBudgetTokens(requestBody.thinking.budget_tokens);
-            allText += `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
+        if (requestBody.thinking?.type && typeof requestBody.thinking.type === 'string') {
+            const t = requestBody.thinking.type.toLowerCase().trim();
+            if (t === 'enabled') {
+                const budget = this._normalizeThinkingBudgetTokens(requestBody.thinking.budget_tokens);
+                allText += `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
+            } else if (t === 'adaptive') {
+                const effortRaw = typeof requestBody.thinking.effort === 'string' ? requestBody.thinking.effort : '';
+                const effort = effortRaw.toLowerCase().trim();
+                const normalizedEffort = (effort === 'low' || effort === 'medium' || effort === 'high') ? effort : 'high';
+                allText += `<thinking_mode>adaptive</thinking_mode><thinking_effort>${normalizedEffort}</thinking_effort>`;
+            }
         }
         
         // Count all messages tokens
@@ -2652,9 +3034,31 @@ async saveCredentialsToFile(filePath, newData) {
         } else {
             // Non-streaming response (full message object)
             const contentArray = [];
-            let stopReason = "end_turn";
             let outputTokens = 0;
 
+            // 1) Content blocks (text/thinking) first.
+            if (Array.isArray(content)) {
+                for (const block of content) {
+                    if (!block || typeof block !== 'object') continue;
+                    if (block.type === 'text' && typeof block.text === 'string') {
+                        contentArray.push({ type: 'text', text: block.text });
+                        outputTokens += this.countTextTokens(block.text);
+                    } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+                        contentArray.push({ type: 'thinking', thinking: block.thinking });
+                        outputTokens += this.countTextTokens(block.thinking);
+                    } else if (typeof block.text === 'string' && block.text) {
+                        // Best-effort fallback for unknown blocks carrying plain text.
+                        contentArray.push({ type: 'text', text: block.text });
+                        outputTokens += this.countTextTokens(block.text);
+                    }
+                }
+            } else if (content) {
+                contentArray.push({ type: "text", text: content });
+                outputTokens += this.countTextTokens(content);
+            }
+
+            // 2) Append tool_use blocks (if any).
+            let stopReason = "end_turn";
             if (toolCalls && toolCalls.length > 0) {
                 for (const tc of toolCalls) {
                     let inputObject;
@@ -2677,12 +3081,6 @@ async saveCredentialsToFile(filePath, newData) {
                     outputTokens += this.countTextTokens(tc.function.arguments);
                 }
                 stopReason = "tool_use"; // Set stop_reason to "tool_use" when toolCalls exist
-            } else if (content) {
-                contentArray.push({
-                    type: "text",
-                    text: content
-                });
-                outputTokens += this.countTextTokens(content);
             }
 
             return {
@@ -2705,7 +3103,8 @@ async saveCredentialsToFile(filePath, newData) {
      * List available models
      */
     async listModels() {
-        const models = KIRO_MODELS.map(id => ({
+        const modelNames = await this._getModelNames();
+        const models = modelNames.map(id => ({
             name: id
         }));
         
