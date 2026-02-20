@@ -83,6 +83,23 @@ function normalizeDashVersionModel(modelName) {
     return modelName.trim().replace(/-(\d+)-(\d+)(?=(?:-|$))/g, '-$1.$2');
 }
 
+function normalizeDotVersionModel(modelName) {
+    if (typeof modelName !== 'string' || !modelName.trim()) {
+        return modelName;
+    }
+    return modelName.trim().replace(/-(\d+)\.(\d+)(?=(?:-|$))/g, '-$1-$2');
+}
+
+function stripClaudeDateSuffix(modelName) {
+    if (typeof modelName !== 'string' || !modelName.trim()) {
+        return modelName;
+    }
+    return modelName.trim().replace(
+        /^(claude-(?:haiku|sonnet|opus)-\d+(?:[.-]\d+)?)-\d{8}$/i,
+        '$1'
+    );
+}
+
 const KIRO_MODEL_ALIASES = {
     'minimax-m2-1': 'minimax-m2.1',
     'minimax-m2_1': 'minimax-m2.1',
@@ -98,23 +115,63 @@ function normalizeExternalModelAlias(modelName) {
     return KIRO_MODEL_ALIASES[trimmed] || normalizeDashVersionModel(trimmed);
 }
 
-function resolveKiroModel(model, defaultModelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME) {
-    const normalizedModel = typeof model === 'string' && model.trim() ? model.trim() : defaultModelName;
-    const aliasedModel = normalizeExternalModelAlias(normalizedModel);
-    const mappedModelId = MODEL_MAPPING[normalizedModel] || MODEL_MAPPING[aliasedModel];
-    const apiModel = MODEL_MAPPING[normalizedModel] ? normalizedModel : aliasedModel;
+function buildModelResolutionCandidates(modelName) {
+    const candidates = [];
+    const seen = new Set();
+    const queue = [];
 
-    if (mappedModelId) {
-        return {
-            apiModel,
-            codewhispererModel: mappedModelId,
-            isMapped: true
-        };
+    const push = (value) => {
+        if (typeof value !== 'string') return;
+        const trimmed = value.trim();
+        if (!trimmed || seen.has(trimmed)) return;
+        seen.add(trimmed);
+        candidates.push(trimmed);
+        queue.push(trimmed);
+    };
+
+    push(modelName);
+
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (typeof current !== 'string') continue;
+        const trimmed = current.trim();
+        if (!trimmed) continue;
+
+        const alias = normalizeExternalModelAlias(trimmed);
+        if (alias && alias !== trimmed) push(alias);
+
+        const dotVersion = normalizeDashVersionModel(trimmed);
+        if (dotVersion && dotVersion !== trimmed) push(dotVersion);
+
+        const dashVersion = normalizeDotVersionModel(trimmed);
+        if (dashVersion && dashVersion !== trimmed) push(dashVersion);
+
+        const noDateSuffix = stripClaudeDateSuffix(trimmed);
+        if (noDateSuffix && noDateSuffix !== trimmed) push(noDateSuffix);
     }
 
+    return candidates;
+}
+
+function resolveKiroModel(model, defaultModelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME) {
+    const normalizedModel = typeof model === 'string' && model.trim() ? model.trim() : defaultModelName;
+    const candidates = buildModelResolutionCandidates(normalizedModel);
+
+    for (const candidate of candidates) {
+        const mappedModelId = MODEL_MAPPING[candidate] || FULL_MODEL_MAPPING[candidate];
+        if (mappedModelId) {
+            return {
+                apiModel: candidate,
+                codewhispererModel: mappedModelId,
+                isMapped: true
+            };
+        }
+    }
+
+    const passthroughModel = normalizeExternalModelAlias(normalizedModel);
     return {
-        apiModel,
-        codewhispererModel: apiModel,
+        apiModel: passthroughModel,
+        codewhispererModel: passthroughModel,
         isMapped: false
     };
 }
@@ -823,30 +880,46 @@ async loadCredentials() {
     }
 
     async _ensureSupportedModelOrThrow(model) {
-        const requestedModel = normalizeExternalModelAlias(normalizeModelName(model, this.modelName));
+        const requestedModel = normalizeModelName(model, this.modelName);
+        const requestedCandidates = buildModelResolutionCandidates(requestedModel);
 
         if (!this.strictModelValidation) {
-            return requestedModel;
+            return requestedCandidates[0] || requestedModel;
         }
 
         let allowedModels = await this._getModelNames();
-        if (allowedModels.includes(requestedModel)) {
-            return requestedModel;
+        for (const candidate of requestedCandidates) {
+            if (allowedModels.includes(candidate)) {
+                return candidate;
+            }
         }
 
         // If current cache is stale (or not from upstream), force refresh once before rejecting.
         if (this.modelListCache?.stale || this.modelListCache?.source !== 'upstream') {
             allowedModels = await this._getModelNames({ forceRefresh: true });
-            if (allowedModels.includes(requestedModel)) {
-                return requestedModel;
+            for (const candidate of requestedCandidates) {
+                if (allowedModels.includes(candidate)) {
+                    return candidate;
+                }
+            }
+        }
+
+        // If upstream model list is lagging, allow models we can resolve via built-in mapping.
+        for (const candidate of requestedCandidates) {
+            if (FULL_MODEL_MAPPING[candidate]) {
+                logger.info(
+                    `[Kiro] Model '${requestedModel}' not in upstream list; resolved via built-in mapping as '${candidate}'.`
+                );
+                return candidate;
             }
         }
 
         if (this.allowUnlistedModelPassthrough) {
+            const passthroughModel = requestedCandidates[0] || requestedModel;
             logger.warn(
-                `[Kiro] Model '${requestedModel}' not found in refreshed list; allowing passthrough. Cache source: ${this.modelListCache?.source || 'unknown'}`
+                `[Kiro] Model '${requestedModel}' not found in refreshed list; allowing passthrough as '${passthroughModel}'. Cache source: ${this.modelListCache?.source || 'unknown'}`
             );
-            return requestedModel;
+            return passthroughModel;
         }
 
         throw buildUnsupportedModelError(requestedModel, allowedModels, this.modelListCache?.source || 'unknown');
@@ -1226,7 +1299,11 @@ async saveCredentialsToFile(filePath, newData) {
                         const originalLength = desc.length;
                         
                         if (desc.length > MAX_DESCRIPTION_LENGTH) {
-                            desc = desc.substring(0, MAX_DESCRIPTION_LENGTH) + "...";
+                            // Keep final length <= MAX_DESCRIPTION_LENGTH after adding ellipsis.
+                            const truncateTo = Math.max(0, MAX_DESCRIPTION_LENGTH - 3);
+                            desc = truncateTo > 0
+                                ? `${desc.substring(0, truncateTo)}...`
+                                : desc.substring(0, MAX_DESCRIPTION_LENGTH);
                             truncatedCount++;
                             logger.info(`[Kiro] Truncated tool '${tool.name}' description: ${originalLength} -> ${desc.length} chars`);
                         }
